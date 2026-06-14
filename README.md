@@ -1,219 +1,184 @@
-# ZakkiPay PPOB (v2 — upgraded)
+# ZakkiPay PPOB (v3 — Vercel Serverless + PostgreSQL)
+
+Versi ini dirombak total agar bisa di-deploy langsung ke **Vercel** (frontend + backend
+dalam satu project), dengan database **PostgreSQL** (Vercel Postgres / Neon / Supabase /
+Railway Postgres — semua kompatibel) menggantikan SQLite.
+
+## Mengapa dirombak?
+
+Versi sebelumnya pakai Express + `better-sqlite3` yang menyimpan data ke file `ppob.db`
+di disk. Vercel adalah platform **serverless**: filesystem-nya read-only dan setiap
+request bisa dijalankan di instance berbeda — jadi file SQLite **tidak bisa dipakai**
+(data hilang / tidak konsisten antar request).
+
+Solusi: backend ditulis ulang sebagai **Vercel Serverless Functions** (folder `api/`),
+dan storage dipindah ke **PostgreSQL** (database eksternal yang persisten, gratis di
+Neon/Vercel Postgres/Supabase).
 
 ## Struktur Project
+
 ```
 zakkipay/
-├── backend/
-│   ├── index.js
-│   ├── config.js          ← validasi & load semua env
-│   ├── logger.js
-│   ├── db.js               ← + balance_logs (audit trail saldo)
-│   ├── .env                ← SUDAH diisi (JWT_SECRET random siap pakai)
-│   ├── .env.example
-│   ├── middleware/
-│   │   ├── auth.js          ← cek user aktif + role
-│   │   ├── admin.js
-│   │   └── rateLimit.js      ← anti spam tanpa dependency tambahan
-│   └── routes/
-│       ├── auth.js          ← validasi email/phone, pesan generik saat login gagal
-│       ├── topup.js         ← webhook pakai secret key, idempotent
-│       ├── order.js         ← saldo atomik + auto refund jika gagal
-│       └── user.js          ← + /balance-history
-└── frontend/
-    ├── package.json
-    ├── public/index.html
-    └── src/
-        ├── index.js
-        └── App.jsx           ← API URL via REACT_APP_API_URL
+├── api/                     ← Setiap file = 1 serverless function (Vercel)
+│   ├── auth/
+│   │   ├── register.js       POST /api/auth/register
+│   │   └── login.js           POST /api/auth/login
+│   ├── user/
+│   │   ├── me.js               GET /api/user/me
+│   │   └── balance-history.js  GET /api/user/balance-history
+│   ├── topup/
+│   │   ├── create.js          POST /api/topup/create
+│   │   ├── status/[id].js      GET /api/topup/status/:id
+│   │   ├── webhook.js         POST /api/topup/webhook?key=...
+│   │   └── history.js          GET /api/topup/history
+│   ├── order/
+│   │   ├── products.js         GET /api/order/products
+│   │   ├── buy.js              POST /api/order/buy
+│   │   └── history.js          GET /api/order/history
+│   ├── voucher/
+│   │   ├── redeem.js          POST /api/voucher/redeem
+│   │   └── history.js          GET /api/voucher/history
+│   ├── admin/
+│   │   ├── stats.js            GET /api/admin/stats
+│   │   ├── orders.js           GET /api/admin/orders
+│   │   ├── topups.js           GET /api/admin/topups
+│   │   ├── users/index.js      GET /api/admin/users
+│   │   ├── users/[id]/
+│   │   │   ├── index.js        GET /api/admin/users/:id
+│   │   │   ├── balance.js      POST /api/admin/users/:id/balance
+│   │   │   ├── status.js       POST /api/admin/users/:id/status
+│   │   │   └── role.js         POST /api/admin/users/:id/role
+│   │   └── vouchers/
+│   │       ├── index.js        GET/POST /api/admin/vouchers
+│   │       └── [id]/
+│   │           ├── index.js     PATCH/DELETE /api/admin/vouchers/:id
+│   │           └── redemptions/index.js  GET /api/admin/vouchers/:id/redemptions
+│   ├── health.js               GET /api/health
+│   └── index.js                 GET /api
+├── lib/                     ← Modul bersama, dipakai semua function di atas
+│   ├── db.js                 Koneksi PostgreSQL (pg Pool, transaction, adjustBalance)
+│   ├── config.js             Load & validasi environment variables
+│   ├── auth.js               JWT sign/verify, requireAuth, requireAdmin
+│   ├── http.js               CORS, body parsing, error handler, rate limit
+│   └── topup.js              Logic settle topup (shared status & webhook)
+├── sql/
+│   └── schema.sql            Skema PostgreSQL — jalankan sekali di database kamu
+├── scripts/
+│   └── make-admin.js         CLI untuk jadikan user admin (jalan dari lokal)
+├── frontend/                  React app (tidak banyak berubah, lihat di bawah)
+├── package.json
+├── vercel.json
+└── .env.example
 ```
 
-## Apa yang berubah dari versi sebelumnya
+## Cara Deploy ke Vercel
 
-- **JWT_SECRET sudah diisi otomatis** dengan string random aman (48 byte hex) di `.env`. Tidak perlu diisi manual. Kalau mau ganti, generate ulang dengan:
-  ```bash
-  node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
-  ```
-- **Webhook/callback sekarang divalidasi pakai secret key**, bukan whitelist IP (cocok untuk Railway/Render/Vercel yang IP-nya dinamis).
-- **Audit trail saldo** (`balance_logs`): setiap top up, pembelian, refund tercatat — saldo tidak akan "hilang" tanpa jejak.
-- **Saldo & order atomik**: kalau gateway gagal/timeout saat `buy`, saldo otomatis dikembalikan (refund) dan order dicatat `FAILED`.
-- **Validasi input lebih ketat** di register/login (format email, panjang nomor HP, dll), pesan error login digeneralisasi (tidak bilang "email tidak ditemukan" — mencegah enumerasi akun).
-- **Rate limiting** bawaan (tanpa dependency baru): 120 req/menit global, 20 req/15menit khusus `/api/auth`.
-- **Security headers dasar** (`X-Content-Type-Options`, `X-Frame-Options`, dst) dan **CORS dibatasi** ke domain frontend kamu (`FRONTEND_ORIGIN`).
-- **Graceful shutdown** + WAL mode SQLite agar tidak corrupt saat container restart.
-- **trust proxy** diaktifkan — wajib untuk Railway/Render agar IP & rate limit akurat.
+### 1. Siapkan database PostgreSQL
 
----
+Pilih salah satu (semua punya free tier):
 
-## ⚠️ PENTING: SQLite + Railway free tier
+- **Vercel Postgres** (Storage tab di dashboard project Vercel) — paling mudah karena
+  `POSTGRES_URL` otomatis terhubung ke project.
+- **Neon** (neon.tech) — buat project, copy connection string.
+- **Supabase** atau **Railway Postgres** — sama, copy connection string.
 
-`better-sqlite3` menyimpan data ke file `ppob.db` di disk container. **Railway free tier menggunakan ephemeral filesystem** — setiap kali redeploy, file ini bisa hilang (saldo & history user ikut hilang).
-
-Untuk produksi yang serius, sebaiknya:
-- Gunakan **Railway Volume** (mount persistent disk ke folder backend), atau
-- Migrasi ke database eksternal (PostgreSQL — Railway/Neon/Supabase punya free tier dengan storage persisten).
-
-Untuk testing/skala kecil, SQLite + Volume sudah cukup.
-
----
-
-## Setup Backend (lokal)
+Setelah punya connection string, jalankan skema:
 
 ```bash
-cd backend
-npm install
-npm start
+psql "postgresql://user:pass@host/dbname?sslmode=require" -f sql/schema.sql
 ```
 
-`.env` sudah terisi JWT_SECRET. Yang **wajib kamu cek/isi sendiri**:
-- `ZAKKI_TOKEN` & `ZAKKI_API` — sudah ada nilai default, ganti kalau token kamu berbeda
-- `WEBHOOK_SECRET` — ganti dengan string acak (lihat bagian Callback di bawah)
-- `FRONTEND_ORIGIN` — domain Vercel kamu setelah deploy
+Atau paste isi `sql/schema.sql` ke SQL editor (Neon/Supabase keduanya punya SQL editor
+di dashboard).
 
-## Setup Frontend (lokal)
+### 2. Push project ke GitHub, lalu import ke Vercel
 
-```bash
-cd frontend
-npm install
-npm start
-```
+Saat import project di Vercel:
 
-Untuk production, buat file `.env` di folder frontend:
-```
-REACT_APP_API_URL=https://NAMA-BACKEND-KAMU.up.railway.app/api
-```
+- **Framework Preset**: pilih "Other" (root `vercel.json` sudah mengatur build).
+- Vercel akan otomatis mendeteksi folder `api/` sebagai Serverless Functions dan
+  menjalankan `cd frontend && npm install && npm run build` untuk frontend (lihat
+  `vercel.json`).
 
----
+### 3. Set Environment Variables di Vercel
 
-## 🔗 Setup Callback / Webhook (WAJIB)
+Buka **Project Settings → Environment Variables**, isi sesuai `.env.example`:
 
-Sebelumnya endpoint webhook (`/api/topup/webhook`) sudah ada di kode, tapi belum aman karena tidak ada IP whitelist dan IP Railway/Vercel memang **dinamis** (tidak bisa di-whitelist). Solusinya: pakai **secret key di URL**.
-
-### 1. Generate secret
-```bash
-node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
-```
-Masukkan hasilnya ke `.env` sebagai `WEBHOOK_SECRET`.
-
-### 2. Daftarkan URL webhook ke Zakki
-Setelah backend live di Railway (misal `https://zakkipay-backend.up.railway.app`), buka URL ini sekali di browser (atau curl):
-
-```
-https://qris.zakki.store/setcallback?token=22ab8cb71fe2bb&site=https%3A%2F%2Fzakkipay-backend.up.railway.app%2Fapi%2Ftopup%2Fwebhook%3Fkey%3DISI_WEBHOOK_SECRET_KAMU
-```
-
-> Catatan: `site` harus URL-encoded karena mengandung `?` dan `&`. Ganti `ISI_WEBHOOK_SECRET_KAMU` dengan nilai `WEBHOOK_SECRET` di `.env`.
-
-### 3. Cara kerja
-- User bayar QRIS → Zakki kirim `POST` ke `/api/topup/webhook?key=...`
-- Backend cek `key` cocok dengan `WEBHOOK_SECRET` → kalau cocok, saldo user ditambahkan otomatis
-- Idempotent: kalau Zakki kirim callback dua kali untuk transaksi yang sama, saldo **tidak** ditambah dua kali
-- Sebagai fallback, frontend juga polling `/api/topup/status/:id` setiap beberapa detik (jaga-jaga kalau webhook gagal terkirim)
-
-Tanpa `WEBHOOK_SECRET` di-set, endpoint tetap berfungsi tapi **tanpa validasi** (siapapun yang tahu URL bisa memicu penambahan saldo palsu) — selalu set ini di production.
-
----
-
-## Flow Saldo
-
-1. User topup 10k → dapat QRIS
-2. User bayar QRIS
-3. Zakki kirim webhook ke `/api/topup/webhook?key=...` (atau frontend polling status)
-4. Saldo user +10k di DB kamu (tercatat di `balance_logs`)
-5. Saldo gateway Zakki kamu otomatis +10k juga
-
----
-
-## Hosting Gratis
-
-### Backend → Railway.app
-1. Push folder `/backend` ke GitHub
-2. Connect repo di railway.app
-3. Set semua environment variable dari `.env` (terutama `ZAKKI_TOKEN`, `JWT_SECRET`, `WEBHOOK_SECRET`, `FRONTEND_ORIGIN`)
-4. (Opsional, disarankan) Tambahkan **Volume** dan mount ke `/app` agar `ppob.db` persisten antar deploy
-5. Deploy otomatis — catat URL yang diberikan Railway
-
-### Frontend → Vercel
-1. Push folder `/frontend` ke GitHub
-2. Connect di vercel.com, framework: Create React App
-3. Set env var `REACT_APP_API_URL` = `https://<url-railway-kamu>/api`
-4. Deploy
-
-### Setelah keduanya live
-1. Update `FRONTEND_ORIGIN` di Railway dengan domain Vercel kamu, redeploy
-2. Daftarkan webhook seperti langkah di atas
-
----
-
-## 👑 Fitur Admin
-
-### 1. Jadikan diri sendiri admin
-Register dulu lewat aplikasi seperti biasa, lalu jalankan di server (Railway shell / lokal):
-```bash
-cd backend
-npm run make-admin -- email@kamu.com
-```
-Setelah itu, login ulang (token lama tidak punya role admin) untuk mendapat akses penuh.
-
-### 2. Endpoint Admin (semua butuh header `Authorization: Bearer <token>` milik admin)
-
-| Method | Endpoint | Fungsi |
+| Variable | Wajib | Keterangan |
 |---|---|---|
-| GET | `/api/admin/stats` | Ringkasan: total user, total saldo beredar, statistik topup/order/voucher |
-| GET | `/api/admin/users?q=keyword` | Cari/list user |
-| GET | `/api/admin/users/:id` | Detail user + 10 order/topup terakhir + 20 log saldo |
-| POST | `/api/admin/users/:id/balance` | `{ amount, note }` — tambah/kurangi saldo manual (boleh negatif) |
-| POST | `/api/admin/users/:id/status` | `{ is_active: true/false }` — ban/unban user |
-| POST | `/api/admin/users/:id/role` | `{ role: "admin" \| "user" }` — ubah role |
-| GET | `/api/admin/orders?status=SUCCESS` | List semua order (filter opsional) |
-| GET | `/api/admin/topups?status=PENDING` | List semua topup (filter opsional) |
-| GET | `/api/admin/vouchers` | List semua voucher |
-| POST | `/api/admin/vouchers` | Buat voucher baru (lihat format di bawah) |
-| PATCH | `/api/admin/vouchers/:id` | Edit voucher (nominal, kuota, status, expired, dst) |
-| DELETE | `/api/admin/vouchers/:id` | Nonaktifkan voucher (soft delete) |
-| GET | `/api/admin/vouchers/:id/redemptions` | Lihat siapa saja yang klaim voucher tertentu |
+| `POSTGRES_URL` | ✅ | Connection string Postgres (otomatis terisi kalau pakai Vercel Postgres) |
+| `ZAKKI_TOKEN` | ✅ | Token dari Zakki QRIS gateway |
+| `ZAKKI_API` | opsional | Default `https://qris.zakki.store` |
+| `JWT_SECRET` | ✅ | String random ≥32 karakter, **harus permanen** (generate sekali, jangan diganti-ganti) |
+| `JWT_EXPIRES_IN` | opsional | Default `7d` |
+| `WEBHOOK_SECRET` | ✅ (untuk webhook) | String rahasia untuk validasi callback Zakki |
+| `FRONTEND_ORIGIN` | opsional | `*` jika frontend & backend satu project (default) |
 
-Admin tidak bisa menonaktifkan / mengubah role akun miliknya sendiri (mencegah lockout).
+Generate `JWT_SECRET` dan `WEBHOOK_SECRET`:
 
----
-
-## 🎟️ Sistem Voucher
-
-Voucher = kode promo yang user masukkan untuk menambah saldo, tanpa perlu top up QRIS.
-
-### Membuat voucher (admin)
-```http
-POST /api/admin/vouchers
-{
-  "code": "GASKEUN50K",
-  "nominal": 50000,       // saldo yang didapat tiap klaim
-  "quota": 100,            // total bisa diklaim 100x (oleh siapapun, gabungan)
-  "max_per_user": 1,       // tiap user maksimal klaim 1x kode ini
-  "expires_at": "2026-12-31T23:59:59"  // opsional, null = tidak expired
-}
+```bash
+node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
 ```
 
-### Klaim voucher (user)
-```http
-POST /api/voucher/redeem
-Authorization: Bearer <token>
-{ "code": "GASKEUN50K" }
+⚠️ **Penting**: `JWT_SECRET` harus sama di semua deployment dan tidak boleh berubah,
+karena setiap kali berubah, semua user yang sedang login akan ter-logout.
+
+### 4. Daftarkan Webhook ke Zakki (opsional, untuk auto-deteksi pembayaran)
+
+Setelah deploy, daftarkan callback URL agar saldo otomatis bertambah saat QRIS dibayar
+(selain polling `/api/topup/status/:id` yang sudah berjalan dari frontend):
+
 ```
-Respons sukses: saldo bertambah otomatis + tercatat di `balance_logs` (tipe `VOUCHER`) dan `voucher_redemptions`.
-
-Validasi otomatis: kode tidak ditemukan, voucher nonaktif, sudah expired, kuota habis, atau user sudah pernah klaim — semua dicek di satu transaksi atomik (anti race-condition saat banyak user klaim bersamaan).
-
-### Riwayat klaim user
-```http
-GET /api/voucher/history
+GET https://qris.zakki.store/setcallback?token=ZAKKI_TOKEN&site=https%3A%2F%2Fdomain-kamu.vercel.app%2Fapi%2Ftopup%2Fwebhook%3Fkey%3DWEBHOOK_SECRET
 ```
 
----
+(Ganti `domain-kamu.vercel.app`, `ZAKKI_TOKEN`, dan `WEBHOOK_SECRET` sesuai konfigurasi
+kamu, dan pastikan seluruh URL ter-encode dengan benar.)
 
-## Skema Database Tambahan
+### 5. Jadikan akun pertama sebagai admin
 
-```sql
-vouchers(id, code, nominal, quota, used_count, max_per_user, min_topup, expires_at, is_active, created_by, created_at)
-voucher_redemptions(id, voucher_id, user_id, nominal, created_at)
+Setelah register lewat aplikasi, jalankan dari komputer lokal (butuh akses ke
+`POSTGRES_URL`):
+
+```bash
+npm install
+POSTGRES_URL="postgresql://...(connection string production)" npm run make-admin -- email@kamu.com
 ```
 
-Catatan klaim voucher juga otomatis tercatat di `balance_logs` dengan `type = 'VOUCHER'`, jadi histori saldo user tetap satu sumber kebenaran (single source of truth).
+## Frontend
+
+Frontend (React) tidak banyak berubah secara fungsional. Yang diubah:
+
+- `REACT_APP_API_URL` default sekarang `/api` (same-origin), cocok untuk deploy
+  frontend+backend dalam satu project Vercel. Kalau backend di-deploy terpisah, set
+  `REACT_APP_API_URL=https://domain-backend.vercel.app/api` di Environment Variables
+  Vercel untuk project frontend.
+
+## Apa yang berubah dari v2 (penting!)
+
+- **Database**: SQLite (`better-sqlite3`) → **PostgreSQL** (`pg`), karena Vercel
+  filesystem-nya read-only & ephemeral. Semua tabel & index dipindah ke
+  `sql/schema.sql` (Postgres syntax: `SERIAL`, `BOOLEAN`, `TIMESTAMPTZ`, `ILIKE`, dll).
+- **Struktur backend**: Express monolith (`backend/index.js` + `routes/*.js`) →
+  **Vercel Serverless Functions** (`api/**/*.js`), satu file = satu endpoint, memakai
+  Node `fetch` bawaan (tidak perlu `node-fetch`).
+- **Transaksi atomik & audit trail saldo** (`balance_logs`, `adjustBalance`) tetap
+  dipertahankan — sekarang via `pg` transaction (`BEGIN`/`COMMIT`/`ROLLBACK`) dengan
+  `SELECT ... FOR UPDATE` untuk mencegah race condition saat saldo dipotong.
+- **CORS & security headers**: dipindah ke `lib/http.js`, dipasang di setiap function
+  (karena tidak ada middleware global seperti Express).
+- **Rate limiting**: tetap berbasis memori per-instance (`lib/http.js`), cukup sebagai
+  lapisan tambahan dasar. Untuk perlindungan lebih kuat di skala besar, pertimbangkan
+  Vercel Firewall atau Upstash Ratelimit (Redis).
+- **Webhook**: logic settle topup dipindah ke `lib/topup.js` agar dipakai bersama oleh
+  endpoint status (polling) dan webhook — tetap idempoten.
+- **`scripts/make-admin.js`**: sekarang konek ke Postgres production via
+  `POSTGRES_URL`, dijalankan dari lokal.
+- Folder `backend/` (Express + SQLite) **dihapus total**, diganti `api/` + `lib/`.
+
+## Catatan keamanan
+
+- Jangan commit file `.env` berisi `POSTGRES_URL`, `JWT_SECRET`, `ZAKKI_TOKEN`, atau
+  `WEBHOOK_SECRET` ke git — gunakan Environment Variables di Vercel.
+- `WEBHOOK_SECRET` wajib diisi di production, atau siapa pun yang tahu URL webhook bisa
+  memicu penambahan saldo palsu.

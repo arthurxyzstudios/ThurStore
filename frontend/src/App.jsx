@@ -2,7 +2,10 @@ import { useState, useEffect, useCallback } from "react";
 
 // Saat deploy ke Vercel, set environment variable REACT_APP_API_URL
 // ke URL backend Railway kamu, contoh: https://zakkipay-backend.up.railway.app/api
-const API = process.env.REACT_APP_API_URL || "http://localhost:3001/api";
+// Default "/api" cocok kalau frontend & backend di-deploy bersamaan di satu
+// project Vercel (lihat vercel.json di root). Kalau backend di domain lain,
+// set REACT_APP_API_URL ke URL lengkap, mis. https://api-domain.vercel.app/api
+const API = process.env.REACT_APP_API_URL || "/api";
 
 const fmt = (n) => "Rp " + Number(n || 0).toLocaleString("id-ID");
 const timeAgo = (d) => {

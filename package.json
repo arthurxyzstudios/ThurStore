@@ -1,0 +1,17 @@
+{
+  "name": "thurs-ppob",
+  "version": "3.0.0",
+  "private": true,
+  "description": "ThurStore PPOB backend — Vercel Serverless Functions + PostgreSQL",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "make-admin": "node scripts/make-admin.js"
+  },
+  "dependencies": {
+    "pg": "^8.11.5",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2"
+  }
+}
